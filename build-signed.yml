@@ -1,0 +1,162 @@
+name: Build & Sign WDA
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [master]
+
+jobs:
+  build:
+    runs-on: macos-15
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Show Xcode info
+        run: |
+          xcodebuild -version
+          sw_vers
+
+      - name: Decode signing secrets
+        env:
+          DEV_P12_BASE64: ${{ secrets.DEV_P12_BASE64 }}
+          MAIN_PROVISION_BASE64: ${{ secrets.MAIN_PROVISION_BASE64 }}
+          RUNNER_PROVISION_BASE64: ${{ secrets.RUNNER_PROVISION_BASE64 }}
+        run: |
+          mkdir -p "$RUNNER_TEMP/signing"
+          echo "$DEV_P12_BASE64" | base64 --decode > "$RUNNER_TEMP/signing/dev.p12"
+          echo "$MAIN_PROVISION_BASE64" | base64 --decode > "$RUNNER_TEMP/signing/main.mobileprovision"
+          echo "$RUNNER_PROVISION_BASE64" | base64 --decode > "$RUNNER_TEMP/signing/runner.mobileprovision"
+          ls -la "$RUNNER_TEMP/signing/"
+
+      - name: Set up keychain and import cert
+        env:
+          DEV_P12_PASSWORD: ${{ secrets.DEV_P12_PASSWORD }}
+        run: |
+          KEYCHAIN_PATH="$RUNNER_TEMP/build.keychain-db"
+          KEYCHAIN_PASSWORD="ci-keychain-pwd"
+          security create-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
+          security set-keychain-settings -lut 21600 "$KEYCHAIN_PATH"
+          security unlock-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
+          security import "$RUNNER_TEMP/signing/dev.p12" \
+            -P "$DEV_P12_PASSWORD" \
+            -A -t cert -f pkcs12 -k "$KEYCHAIN_PATH"
+          security set-key-partition-list -S apple-tool:,apple: -k "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH" || true
+          security list-keychains -d user -s "$KEYCHAIN_PATH" $(security list-keychains -d user | tr -d '"')
+          security default-keychain -s "$KEYCHAIN_PATH"
+          echo "--- Identities found ---"
+          security find-identity -v -p codesigning "$KEYCHAIN_PATH"
+
+      - name: Extract entitlements from profiles
+        run: |
+          security cms -D -i "$RUNNER_TEMP/signing/main.mobileprovision" -o "$RUNNER_TEMP/signing/main_profile.plist"
+          security cms -D -i "$RUNNER_TEMP/signing/runner.mobileprovision" -o "$RUNNER_TEMP/signing/runner_profile.plist"
+          plutil -extract Entitlements xml1 -o "$RUNNER_TEMP/signing/main_entitlements.plist" "$RUNNER_TEMP/signing/main_profile.plist"
+          plutil -extract Entitlements xml1 -o "$RUNNER_TEMP/signing/runner_entitlements.plist" "$RUNNER_TEMP/signing/runner_profile.plist"
+          echo "--- main_entitlements.plist ---"
+          cat "$RUNNER_TEMP/signing/main_entitlements.plist"
+          echo "--- runner_entitlements.plist ---"
+          cat "$RUNNER_TEMP/signing/runner_entitlements.plist"
+
+      - name: Build WDA unsigned
+        run: |
+          xcodebuild clean build-for-testing \
+            -project WebDriverAgent.xcodeproj \
+            -derivedDataPath build \
+            -scheme WebDriverAgentRunner \
+            -destination 'generic/platform=iOS' \
+            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGNING_REQUIRED=NO \
+            ARCHS=arm64
+
+      - name: Patch bundle ids and clean frameworks
+        run: |
+          APP_PATH="build/Build/Products/Debug-iphoneos/WebDriverAgentRunner-Runner.app"
+          XCTEST_PATH="$APP_PATH/PlugIns/WebDriverAgentRunner.xctest"
+
+          # Set bundle ids to match her existing profiles
+          plutil -replace CFBundleIdentifier -string "com.facebook.WebDriverAgentRunner.xctrunner.6YC26628S5" "$APP_PATH/Info.plist"
+          plutil -replace CFBundleIdentifier -string "com.facebook.WebDriverAgentRunner.xctrunner.6YC26628S5.runner" "$XCTEST_PATH/Info.plist"
+
+          # Remove redundant test frameworks (per appium build-real.sh)
+          for fw in XCTestCore.framework XCTAutomationSupport.framework XCUIAutomation.framework XCUnit.framework Testing.framework; do
+            rm -rf "$APP_PATH/Frameworks/$fw" || true
+          done
+          rm -f "$APP_PATH/Frameworks/libXCTestSwiftSupport.dylib" || true
+
+          # Install profiles into bundles
+          cp "$RUNNER_TEMP/signing/main.mobileprovision" "$APP_PATH/embedded.mobileprovision"
+          cp "$RUNNER_TEMP/signing/runner.mobileprovision" "$XCTEST_PATH/embedded.mobileprovision"
+
+          echo "--- App bundle structure ---"
+          find "$APP_PATH" -maxdepth 4 -type d
+          echo "--- Bundle IDs ---"
+          plutil -extract CFBundleIdentifier raw "$APP_PATH/Info.plist"
+          plutil -extract CFBundleIdentifier raw "$XCTEST_PATH/Info.plist"
+
+      - name: Sign nested xctest first (inside-out per TN2206)
+        run: |
+          APP_PATH="build/Build/Products/Debug-iphoneos/WebDriverAgentRunner-Runner.app"
+          XCTEST_PATH="$APP_PATH/PlugIns/WebDriverAgentRunner.xctest"
+          IDENTITY=$(security find-identity -v -p codesigning "$RUNNER_TEMP/build.keychain-db" | grep -E 'Apple Development|iPhone Developer' | head -1 | awk '{print $2}')
+          echo "Using identity: $IDENTITY"
+
+          # Sign frameworks inside .xctest if any
+          if [ -d "$XCTEST_PATH/Frameworks" ]; then
+            for fw in "$XCTEST_PATH/Frameworks"/*.framework "$XCTEST_PATH/Frameworks"/*.dylib; do
+              [ -e "$fw" ] || continue
+              codesign --force --sign "$IDENTITY" --timestamp=none --keychain "$RUNNER_TEMP/build.keychain-db" "$fw"
+            done
+          fi
+
+          # Sign the .xctest bundle with runner entitlements + runner profile
+          codesign --force \
+            --sign "$IDENTITY" \
+            --entitlements "$RUNNER_TEMP/signing/runner_entitlements.plist" \
+            --timestamp=none \
+            --keychain "$RUNNER_TEMP/build.keychain-db" \
+            "$XCTEST_PATH"
+
+          echo "--- xctest signature ---"
+          codesign -dvv "$XCTEST_PATH"
+
+      - name: Sign outer .app
+        run: |
+          APP_PATH="build/Build/Products/Debug-iphoneos/WebDriverAgentRunner-Runner.app"
+          IDENTITY=$(security find-identity -v -p codesigning "$RUNNER_TEMP/build.keychain-db" | grep -E 'Apple Development|iPhone Developer' | head -1 | awk '{print $2}')
+
+          # Sign frameworks at app level
+          if [ -d "$APP_PATH/Frameworks" ]; then
+            for fw in "$APP_PATH/Frameworks"/*.framework "$APP_PATH/Frameworks"/*.dylib; do
+              [ -e "$fw" ] || continue
+              codesign --force --sign "$IDENTITY" --timestamp=none --keychain "$RUNNER_TEMP/build.keychain-db" "$fw"
+            done
+          fi
+
+          # Sign main .app bundle with main entitlements + main profile
+          codesign --force \
+            --sign "$IDENTITY" \
+            --entitlements "$RUNNER_TEMP/signing/main_entitlements.plist" \
+            --timestamp=none \
+            --keychain "$RUNNER_TEMP/build.keychain-db" \
+            "$APP_PATH"
+
+          echo "--- app signature ---"
+          codesign -dvv "$APP_PATH"
+          echo "--- verify nested ---"
+          codesign --verify --verbose=4 "$APP_PATH"
+
+      - name: Package signed ipa
+        run: |
+          APP_PATH="build/Build/Products/Debug-iphoneos/WebDriverAgentRunner-Runner.app"
+          mkdir -p Payload
+          cp -R "$APP_PATH" Payload/
+          zip -qr WDA-signed.ipa Payload
+          ls -la WDA-signed.ipa
+
+      - name: Upload signed artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: WDA-signed-ipa
+          path: WDA-signed.ipa
+          retention-days: 30
